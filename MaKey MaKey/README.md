@@ -1,0 +1,1 @@
+This code is only designed to work with the original, very old, MaKey MaKey (v1). burntcustard's MaKey MaKey is also heavily hardware modified. Basically, don't try use this yourself. But questions on WTF it is are welcome.
