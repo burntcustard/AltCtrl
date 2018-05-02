@@ -34,44 +34,50 @@
 // CONFIGURABLES //
 ///////////////////
 
-// Debug Flags (DEBUG must be uncommented for any others be enabled)
+// Debug Flags (DEBUG must be uncommented for others to be enabled)
 //#define DEBUG
-//#define DEBUG_GYRO_CALIBRATION
+//#define DEBUG_TOUCH
 //#define DEBUG_ACCEL
 //#define DEBUG_GYRO
+//#define DEBUG_GYRO_CAL
 //#define DEBUG_AIMING
-//#define DEBUG_TOUCH
 
 // Physical Buttons for Mouse Clicks (used w/ internal pull-up resistor)
 #define TRIGGER_1 10
 #define TRIGGER_2 9
 
 // Capacitive Touch Sensitive Input Pins & Keyboard Keys
-const uint8_t TouchPins[] = { 15, 16, 14 };  // Keyboard pins followed by any other(s)
-const uint8_t TouchDebounce = 8;  // Higher makes detection slower but less flickery.
-const int KeyCodes[] = { 'e', 'r' }; // Keycodes to press when input touched.
+const uint8_t TouchPins[] = { 15, 16, 14 }; // Keyboard pins followed by any other(s)
+const uint8_t TouchDebounce = 6;            // Higher makes detection slower but less flickery.
+const int KeyCodes[] = { 'e', 'r' };        // Keycodes to press when input touched.
 
 // Thumbstick/Joystick:
-#define VRx A0  // X (should be on an analog pin)
-#define VRy A1  // Y (should be on an analog pin)
-#define SW 4    // Button
+#define VRx A0 // X (Should be on an analog pin)
+#define VRy A1 // Y (Should be on an analog pin)
+#define SW 4   // Thumbstick push button
 const int joystickThreshold = 50;
-char* joystickKeys[] = { 'w','a','s','d' };
-char swKey = ' ';
+const char* joystickKeys[] = { 'w','a','s','d' };
+const char swKey = ' ';
+
+// Auto-Calibration Options
+const uint8_t GyroCalibrationTime = 100;  // Time in ms that gyro is calibrated for on each attempt.
+const uint8_t MaxCalAttempts = 10;        // Maximum number of calibration attempts before {0,0,0} used.
+const int16_t CalAttemptInterval = 1000;  // Time in ms between calibration attempts.
+const int16_t CalDiversityThreshold = 30; // If a value is not like the others, calibration is reattempted.
 
 // General Aim Sensitivity
 const float OverwatchSens = 4;  // User mouse sensitivity in Overwatch
-const float AimSpeedFactor = 1.2; // Factor to multiply aimspeed by
+const float AimSpeedFactor = 2; // Factor to multiply aimspeed by
 
-// Tuning Options
-const long    IMU_UpdateRate = 5;  // Time between each IMU (mouse) update in ms.
-const uint8_t GyroCalibrationTime = 100; // Time in ms that gyro is calibrated for at startup.
+// IMU / Aiming Options
+const long    IMU_UpdateRate = 5; // Time between each IMU (mouse) update in ms.
 const uint8_t FS_Sel = 1; // Gyroscope range select, 500°/s
 const int16_t GyroZeroThreshold = 120 / (1 << FS_Sel); // Level below which to null inputs, adjusted for range
-const int16_t Aim_ExponentialThreshold = 5; // Threshold before exponential aiming kicks in, in °/s
-const float   Aim_ExponentFactor = 0.0; // Factor to multiply the exponent product by, scaled by sensitivity
+const int16_t Aim_ExponentialThreshold = 200; // Threshold before exponential aiming kicks in, in °/s
+const float   Aim_ExponentFactor = 0.03; // Factor to multiply the exponent product by, scaled by sensitivity
 
-// Aim drift compensation, WIP, may not work as intended, <±0.1 recommended
+// Aim drift compensation, WIP, may not work as intended, <±0.1 recommended.
+// Magnetometer use would be better as the drift isn't always in the same direction.
 const float xyAimDrift[] = { 0.008, -0.01 };
 
 
@@ -87,9 +93,7 @@ long timestamp;
 long lastUpdate;
 
 // Gyro auto-calibration values
-int16_t GyroCalX = 0;
-int16_t GyroCalY = 0;
-int16_t GyroCalZ = 0;
+int16_t gyroCal[3];
 
 // Physical Buttons for Mouse Clicks (used w/ internal pull-up resistor)
 boolean trigger1Active = false;
@@ -100,11 +104,9 @@ const uint8_t TouchPinsLength = sizeof(TouchPins)/sizeof(uint8_t);
 const uint8_t KeyCodesLength = sizeof(KeyCodes)/sizeof(int);
 int8_t touchesActive[TouchPinsLength];
 
-// Thumbstick/Joystick:
-int joystickCenterX = 0;
-int joystickCenterY = 0;
-int joystickX = 0;
-int joystickY = 0;
+// Thumbstick/Joystick auto-calibration values:
+int joystickCalX = 0;
+int joystickCalY = 0;
 
 
 ///////////////////
@@ -131,8 +133,8 @@ void setup() {
   mpuStart();
 
   // Center joystick values:
-  joystickCenterX = analogRead(VRx);
-  joystickCenterY = analogRead(VRy);
+  joystickCalX = analogRead(VRx);
+  joystickCalY = analogRead(VRy);
 }
 
 
@@ -149,9 +151,9 @@ void loop() {
     handleIMU();
   }
 
-  triggerInputs();  // Mouse 1 / mouse 2.
-  keyboardInput();  // Touch inputs (mostly simulated keyboard press/releases).
-  joystickInput();  // Thumbstick X/Y & button.
+  triggerInputs(); // Mouse 1 / mouse 2.
+  keyboardInput(); // Touch inputs (mostly simulated keyboard press/releases).
+  joystickInput(); // Thumbstick X/Y & button.
 }
 
 
@@ -160,12 +162,12 @@ void mpuStart() {
   TWBR = 12; // 400 kHz bus speed
 
   Wire.beginTransmission(MPU_addr);
-  Wire.write(0x6B);  // PWR_MGMT_1 register
-  Wire.write(1);     // use GyX oscillator
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(1);    // use GyX oscillator
   Wire.endTransmission(false); // Keep bus active
 
   Wire.beginTransmission(MPU_addr);
-  Wire.write(0x1B);  // GYRO_CONFIG registers
+  Wire.write(0x1B); // GYRO_CONFIG registers
   Wire.write(FS_Sel << 3);  // Gyroscope scale
   Wire.endTransmission(true);
 
@@ -184,43 +186,79 @@ void calibrateGyro() {
   int16_t aX, aY, aZ, temperature, gX, gY, gZ;
   int16_t *IMU_Data[7] = {&aX, &aY, &aZ, &temperature, &gX, &gY, &gZ};
   const int calibrationAmount = GyroCalibrationTime / IMU_UpdateRate;
-  
-  for (int i = 0; i < calibrationAmount; i++) {
-    
-    // Get data from MPU (not using readMPU() because it has unnecessary stuff)
-    Wire.beginTransmission(MPU_addr);
-    Wire.write(0x3B); // Starting with register 0x3B (ACCEL_XOUT_H)
-    Wire.endTransmission(false);
-    Wire.requestFrom(MPU_addr, (uint8_t) 14, (uint8_t) true); // request a total of 14 registers
-    for (int i = 0; i < 7; i++) {
-      *IMU_Data[i] = Wire.read() << 8 | Wire.read(); // A-XYZ, TMP, and G-XYZ
-    }
+  boolean attemptFailed = true; // 1st run activated as if there was one before that failed.
+  int32_t gyroSum[3]; // Used to sum gyro data before finding the average.
+  int32_t gyroTmp[3]; // Used to store temporary running average calibration values.
 
-    // Subtract (because they're later added to correct gyro offset) values
-    GyroCalX -= gX;
-    GyroCalY -= gY;
-    GyroCalZ -= gZ;
-    
-    #ifdef DEBUG_GYRO_CALIBRATION
-      Serial.print(i); Serial.print(": ");
-      Serial.print(gX); Serial.print(" ");
-      Serial.print(gY); Serial.print(" ");
-      Serial.println(gZ);
-    #endif
-    
-    delay(IMU_UpdateRate);
+  #ifdef DEBUG_GYRO_CAL
+    Serial.println("Starting gyro calibration...");
+  #endif
+
+  for (uint8_t attempt = 0; attempt < MaxCalAttempts && attemptFailed; attempt++) {
+    attemptFailed = false;
+
+    // Reset summed calibration values to 0s
+    memset(gyroSum, 0, sizeof(gyroSum));
+
+    // Get a bunch of gyro readings to average and use as calibration XYZ offset values
+    for (uint8_t c = 0; c < calibrationAmount && !attemptFailed; c++) {
+      attemptFailed = false;
+      
+      // Get data from MPU (not using readMPU() because it has unnecessary stuff)
+      Wire.beginTransmission(MPU_addr);
+      Wire.write(0x3B); // Starting with register 0x3B (ACCEL_XOUT_H)
+      Wire.endTransmission(false);
+      Wire.requestFrom(MPU_addr, (uint8_t) 14, (uint8_t) true); // Request a total of 14 registers
+      for (uint8_t i = 0; i < 7; i++) {
+        *IMU_Data[i] = Wire.read() << 8 | Wire.read(); // A-XYZ, TMP, and G-XYZ
+      }
+  
+      for (uint8_t d = 0; d < 3; d++) {
+        // Subtract (because they're later added to correct gyro offset) values
+        gyroSum[d] -= (int32_t) *IMU_Data[4 + d];
+        // Figure out the running average
+        gyroTmp[d] = round(gyroSum[d] / (c + 1));
+        // If the new value is too different from the running average, or overflow occurs...
+        if (abs(abs(*IMU_Data[4 + d]) - abs(gyroTmp[d])) > CalDiversityThreshold  ||
+            abs(gyroTmp[d]) > 32767) {
+          attemptFailed = true;
+        }
+      }
+      
+      #ifdef DEBUG_GYRO_CAL
+        Serial.print(gX); Serial.print(" ");
+        Serial.print(gY); Serial.print(" ");
+        Serial.print(gZ); Serial.println();
+        if (attemptFailed) {
+          Serial.print("Gyro calibration ["); Serial.print(attempt); Serial.println("] failed");
+        }
+      #endif
+
+      if (attemptFailed) {
+        delay(CalAttemptInterval);
+      } else {
+        delay(IMU_UpdateRate);
+      }
+    }
   }
   
-  GyroCalX = round(GyroCalX / calibrationAmount);
-  GyroCalY = round(GyroCalY / calibrationAmount);
-  GyroCalZ = round(GyroCalZ / calibrationAmount);
+  if (!attemptFailed) {
+    for (uint8_t d = 0; d < 3; d++) {
+      gyroCal[d] = round(gyroSum[d] / calibrationAmount);
+    }
+    #ifdef DEBUG_GYRO_CAL
+      Serial.print("Gyro calibrated offset values: ");
+      Serial.print(gyroCal[0]); Serial.print(" ");
+      Serial.print(gyroCal[1]); Serial.print(" ");
+      Serial.println(gyroCal[2]);
+    #endif
+  } else {
+    memset(gyroCal, 0, sizeof(gyroCal)); // Fill array with 0s
+    #ifdef DEBUG_GYRO_CAL
+      Serial.println("Gyro calibration failed too many times. Using default values of 0.");
+    #endif
+  }
   
-  #ifdef DEBUG_GYRO_CALIBRATION
-    Serial.print("Calibrated values: ");
-    Serial.print(GyroCalX); Serial.print(" ");
-    Serial.print(GyroCalY); Serial.print(" ");
-    Serial.println(GyroCalZ);
-  #endif
 }
 
 
@@ -243,12 +281,12 @@ void readMPU(int16_t &aX, int16_t &aY, int16_t &aZ, int16_t &gX, int16_t &gY, in
 
   int16_t MPU_temperature;
   int16_t *IMU_Data[7] = {&aX, &aY, &aZ, &MPU_temperature, &gX, &gY, &gZ};
-  const int16_t GyroCalibration[3] = {
-    // Not sure what the FS_Sel bit was for here but it was breaking the auto-calibration!
-    GyroCalX, // / (1 << FS_Sel),
-    GyroCalY, // / (1 << FS_Sel),
-    GyroCalZ, // / (1 << FS_Sel),
-  };
+  //const int16_t GyroCalibration[3] = {
+  //  // Not sure what the FS_Sel bit was for here but it was breaking the auto-calibration!
+  //  GyroCalX, // / (1 << FS_Sel),
+  //  GyroCalY, // / (1 << FS_Sel),
+  //  GyroCalZ, // / (1 << FS_Sel),
+  //};
 
   Wire.beginTransmission(MPU_addr);
   Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
@@ -262,7 +300,7 @@ void readMPU(int16_t &aX, int16_t &aY, int16_t &aZ, int16_t &gX, int16_t &gY, in
 
   // Calibrate gyro axes and check for overflow
   for (int i = 4; i < 7; i++) {
-    int32_t gyroTemp = (int32_t) * IMU_Data[i] + (int32_t) GyroCalibration[i - 4];
+    int32_t gyroTemp = (int32_t) * IMU_Data[i] + (int32_t) gyroCal[i - 4];
 
     if (gyroTemp > 32767) {
       *IMU_Data[i] = 32767;
@@ -271,7 +309,7 @@ void readMPU(int16_t &aX, int16_t &aY, int16_t &aZ, int16_t &gX, int16_t &gY, in
       *IMU_Data[i] = -32768;
     }
     else {
-      *IMU_Data[i] += GyroCalibration[i - 4];
+      *IMU_Data[i] += gyroCal[i - 4];
       if (abs(*IMU_Data[i]) < GyroZeroThreshold) {
         *IMU_Data[i] = 0;
       }
@@ -508,8 +546,8 @@ void keyboardInput() {
 
 void joystickInput() {  
   // X and Y are flipped because joystick is mounted sideways
-  joystickY =  (analogRead(VRx) - joystickCenterX);
-  joystickX = -(analogRead(VRy) - joystickCenterY);
+  int joystickX = -(analogRead(VRy) - joystickCalY);
+  int joystickY =  (analogRead(VRx) - joystickCalX);
   
   if (joystickY > joystickThreshold) {
     Keyboard.press(joystickKeys[0]);
